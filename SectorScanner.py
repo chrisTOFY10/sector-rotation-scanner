@@ -229,8 +229,18 @@ elif page == "Market Heatmap 📊":
     latest_df = latest_df.dropna(subset=['Return (%)'])
     latest_df = latest_df[latest_df['Volume'] > 0] 
     
-    latest_df[grouping_level] = latest_df[grouping_level].astype(str).replace(['nan', 'None', ''], 'Unclassified')
-    latest_df['Symbol'] = latest_df['Symbol'].astype(str).replace(['nan', 'None', ''], 'Unknown')
+    # --- THE BULLETPROOF HEATMAP FIX ---
+    # 1. Drop garbage data (rows where the stock symbol is completely missing)
+    latest_df = latest_df.dropna(subset=['Symbol'])
+    
+    # 2. Force strings and clean missing categories
+    latest_df[grouping_level] = latest_df[grouping_level].astype(str).replace(['nan', 'None', '', 'NaN', '<NA>'], 'Unclassified')
+    latest_df['Symbol'] = latest_df['Symbol'].astype(str).str.strip()
+    
+    # 3. Add a silent space to the Symbol to guarantee it NEVER perfectly matches an Industry/Sector name
+    latest_df['Symbol'] = latest_df['Symbol'] + " "
+    
+    # 4. Guarantee no duplicates exist on the exact same date
     latest_df = latest_df.drop_duplicates(subset=['Symbol'], keep='last')
 
     if not latest_df.empty:
