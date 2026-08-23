@@ -222,32 +222,43 @@ elif page == "Market Heatmap 📊":
     
     color_sensitivity = st.sidebar.slider("Color Sensitivity (Max Return %)", min_value=1.0, max_value=30.0, value=5.0, step=0.5)
 
+    # 1. Calculate Returns
     df['Return (%)'] = df.groupby('Symbol')['Close'].pct_change(periods=map_window) * 100
     latest_date = df['Date'].max()
     latest_df = df[df['Date'] == latest_date].copy()
     
-    latest_df = latest_df.dropna(subset=['Return (%)'])
+    # 2. Clean numeric anomalies (Drops rows with NaN/Inf returns or 0 volume)
+    latest_df = latest_df.replace([np.inf, -np.inf], np.nan)
+    latest_df = latest_df.dropna(subset=['Return (%)', 'Volume', 'Symbol', grouping_level])
     latest_df = latest_df[latest_df['Volume'] > 0] 
     
-    # --- THE BULLETPROOF HEATMAP FIX ---
-    # 1. Drop garbage data (rows where the stock symbol is completely missing)
-    latest_df = latest_df.dropna(subset=['Symbol'])
+    # 3. Reset index (Crucial for Plotly Express alignment after slicing data)
+    latest_df = latest_df.reset_index(drop=True)
     
-    # 2. Force strings and clean missing categories
-    latest_df[grouping_level] = latest_df[grouping_level].astype(str).replace(['nan', 'None', '', 'NaN', '<NA>'], 'Unclassified')
+    # 4. Clean Text to Prevent "Leaf/Branch" Collisions
+    # Strip whitespace and drop any completely blank symbols so Plotly doesn't build a broken path
     latest_df['Symbol'] = latest_df['Symbol'].astype(str).str.strip()
+    latest_df = latest_df[latest_df['Symbol'] != '']
+    latest_df = latest_df[latest_df['Symbol'].str.lower() != 'nan']
     
-    # 3. Add a silent space to the Symbol to guarantee it NEVER perfectly matches an Industry/Sector name
-    latest_df['Symbol'] = latest_df['Symbol'] + " "
+    # Clean the grouping column
+    latest_df[grouping_level] = latest_df[grouping_level].astype(str).str.strip()
+    latest_df.loc[latest_df[grouping_level] == '', grouping_level] = 'Unclassified'
+    latest_df.loc[latest_df[grouping_level].str.lower() == 'nan', grouping_level] = 'Unclassified'
+
+    # 5. Guarantee Unique Level Names
+    # We add distinct space padding to ensure a Symbol name can never exactly match an Industry name
+    latest_df['Root'] = 'Overall Market'
+    latest_df[grouping_level] = latest_df[grouping_level] + " "
+    latest_df['Symbol'] = latest_df['Symbol'] + "  "
     
-    # 4. Guarantee no duplicates exist on the exact same date
     latest_df = latest_df.drop_duplicates(subset=['Symbol'], keep='last')
 
     if not latest_df.empty:
-        # Dynamically map the path based on user toggle
+        # Notice we use 'Root' now instead of px.Constant
         fig = px.treemap(
             latest_df,
-            path=[px.Constant("Overall Market"), grouping_level, 'Symbol'],
+            path=['Root', grouping_level, 'Symbol'],
             values='Volume',
             color='Return (%)',
             color_continuous_scale='RdYlGn',
@@ -272,7 +283,6 @@ elif page == "Market Heatmap 📊":
         st.info(f"**Viewing Date:** {latest_date.strftime('%Y-%m-%d')} | **Comparing against:** {map_window} trading day(s) prior.")
     else:
         st.warning("No data available to plot for the selected timeframe and exchanges.")
-
 
 # ==========================================
 # PAGE 3: HOW IT WORKS (METRICS GUIDE)
