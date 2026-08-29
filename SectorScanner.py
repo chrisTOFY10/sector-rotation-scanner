@@ -28,22 +28,23 @@ if page == "Scanner Dashboard":
     st.sidebar.header("1. Data Feed")
     st.sidebar.success("🟢 Connected to Live Google Sheet")
 
-    # --- THE NEW SCAN LEVEL TOGGLE ---
     st.sidebar.header("2. Scan Level")
     grouping_level = st.sidebar.radio("Group stocks by:", ["Sector", "Industry"])
-    st.sidebar.caption(f"Currently scanning at the **{grouping_level}** level.")
 
     with st.spinner("Fetching latest market data from Google Sheets..."):
         try:
             df = load_google_sheet()
-            
-            # --- DATA CLEANING ---
             df.columns = df.columns.str.strip()
-            df['Close'] = pd.to_numeric(df['Close'].astype(str).str.replace(r'[\$,]', '', regex=True), errors='coerce')
-            df['Volume'] = pd.to_numeric(df['Volume'].astype(str).str.replace(r'[\$,]', '', regex=True), errors='coerce')
-            df['Date'] = pd.to_datetime(df['Date'])
             
-            # Clean textual columns
+            # --- DATA CLEANING (Added Open for Volume Flow calculation) ---
+            cols_to_clean = ['Open', 'Close', 'Volume']
+            for col in cols_to_clean:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col].astype(str).str.replace(r'[\$,]', '', regex=True), errors='coerce')
+            
+            df['Date'] = pd.to_datetime(df['Date'])
+            has_open = 'Open' in df.columns
+            
             if 'Exchange' in df.columns:
                 df['Exchange'] = df['Exchange'].astype(str).str.strip()
             if 'Sector' in df.columns:
@@ -51,29 +52,24 @@ if page == "Scanner Dashboard":
             if 'Industry' in df.columns:
                 df['Industry'] = df['Industry'].astype(str).str.strip()
                 
-            # Verify the chosen grouping column actually exists in the data
             if grouping_level not in df.columns:
-                st.error(f"⚠️ The column '{grouping_level}' was not found in your data. Please check your data source.")
+                st.error(f"⚠️ The column '{grouping_level}' was not found in your data.")
                 st.stop()
             
-            # --- EXCHANGE FILTER ---
             if 'Exchange' in df.columns:
                 available_exchanges = sorted(df[df['Exchange'] != 'nan']['Exchange'].unique().tolist())
                 selected_exchanges = st.sidebar.multiselect("Select Exchange(s):", options=available_exchanges, default=available_exchanges)
-                
                 if not selected_exchanges:
                     st.warning("⚠️ Please select at least one exchange in the sidebar to run the scan.")
                     st.stop()
-                    
                 df = df[df['Exchange'].isin(selected_exchanges)]
             
             df = df.sort_values(by=['Symbol', 'Date'])
-            
             trading_days = len(df['Date'].unique())
             latest_date = df['Date'].max()
             
             if trading_days < 3:
-                st.error(f"⚠️ **Error:** Your dataset only has {trading_days} day(s) of history for the selected exchanges. You need at least 3 days to calculate momentum.")
+                st.error(f"⚠️ **Error:** Your dataset only has {trading_days} day(s) of history. You need at least 3 days.")
                 st.stop()
                 
             st.sidebar.caption(f"Last updated: {latest_date.strftime('%Y-%m-%d')}")
@@ -82,7 +78,6 @@ if page == "Scanner Dashboard":
             st.error(f"Failed to load data. Error: {e}")
             st.stop()
 
-        # --- SIDEBAR: DYNAMIC TIMEFRAMES ---
         st.sidebar.header("3. Analysis Parameters")
         max_periods = trading_days - 1
         
@@ -94,7 +89,6 @@ if page == "Scanner Dashboard":
         # --- PHASE 1: MACRO ROLL-UP ---
         st.header(f"Phase 1: {grouping_level} Rotation (Capital Flows)")
         
-        # Dynamically group by whatever the user selected (Sector or Industry)
         group_df = df.groupby(['Date', grouping_level]).agg({'Close': 'mean', 'Volume': 'sum'}).reset_index()
         group_metrics = []
         groups = group_df[grouping_level].unique()
@@ -121,47 +115,68 @@ if page == "Scanner Dashboard":
         st.dataframe(group_results, use_container_width=True)
         st.divider()
 
-        # --- PHASE 2: INDIVIDUAL STOCK SCREENER ---
-        st.header(f"Phase 2: Stock Screener (Relative Strength & Breakouts)")
+        # --- PHASE 2 & 3: STOCK SCREENER WITH VOLUME FLOW ---
+        st.header(f"Phase 2: Stock Screener (Relative Strength, Breakouts, & Accumulation)")
         selected_group = st.selectbox(f"Select a Leading {grouping_level} to Scan:", options=group_results[grouping_level].tolist())
         
         if selected_group:
             stock_df = df[df[grouping_level] == selected_group].copy()
             stock_metrics = []
             tickers = stock_df['Symbol'].unique()
-            min_required = max(long_window + 1, vol_window, rs_window)
+            min_required = max(long_window + 1, vol_window, rs_window, 10) # Added 10 for volume flow
             
             with st.spinner(f"Scanning stocks in {selected_group}..."):
                 for ticker in tickers:
                     t_data = stock_df[stock_df['Symbol'] == ticker].sort_values('Date').copy()
                     if len(t_data) < min_required: continue 
                     
-                    # Merge with the dynamically generated group index to calculate RS
                     t_data = pd.merge(t_data, group_df[group_df[grouping_level] == selected_group][['Date', 'Close']], on='Date', suffixes=('', '_Group'))
                     t_data['RS'] = t_data['Close'] / t_data['Close_Group']
                     t_data['RS_MA'] = t_data['RS'].rolling(window=rs_window).mean()
                     t_data['Vol_Baseline'] = t_data['Volume'].rolling(window=vol_window).mean()
                     
+                    # --- PHASE 3: VOLUME-WEIGHTED TREND ---
+                    if has_open:
+                        t_data['Green_Vol'] = np.where(t_data['Close'] > t_data['Open'], t_data['Volume'], 0)
+                        t_data['Red_Vol'] = np.where(t_data['Close'] < t_data['Open'], t_data['Volume'], 0)
+                        t_data['Green_Vol_10D'] = t_data['Green_Vol'].rolling(window=10).sum()
+                        t_data['Red_Vol_10D'] = t_data['Red_Vol'].rolling(window=10).sum()
+                        t_data['Vol_Flow_Ratio'] = np.where(t_data['Red_Vol_10D'] > 0, t_data['Green_Vol_10D'] / t_data['Red_Vol_10D'], np.nan)
+                    
                     latest_t = t_data.iloc[-1]
                     rs_trend = "Uptrend" if latest_t['RS'] > latest_t['RS_MA'] else "Downtrend"
                     vol_breakout = "Yes 🔥" if latest_t['Volume'] > (1.5 * latest_t['Vol_Baseline']) else "No"
+                    
+                    if has_open:
+                        flow_ratio = latest_t['Vol_Flow_Ratio']
+                        if pd.isna(flow_ratio):
+                            flow_status = "N/A"
+                        else:
+                            flow_status = f"{round(flow_ratio, 2)}x (Buy > Sell)" if flow_ratio > 1.0 else f"{round(flow_ratio, 2)}x (Sell > Buy)"
+                    else:
+                        flow_status = "N/A (Missing Open data)"
                     
                     stock_metrics.append({
                         'Symbol': ticker,
                         'Exchange': latest_t['Exchange'] if 'Exchange' in latest_t else 'N/A',
                         'Latest Close': latest_t['Close'],
                         f'RS vs {grouping_level}': rs_trend,
-                        f'Daily Vol vs {vol_window}D Avg': round(latest_t['Volume'] / latest_t['Vol_Baseline'], 2) if latest_t['Vol_Baseline'] > 0 else 0,
-                        'Volume Breakout (>150%)': vol_breakout
+                        'Volume Breakout (>150%)': vol_breakout,
+                        '10-Day Vol Flow': flow_status
                     })
             
             if stock_metrics:
                 final_stocks = pd.DataFrame(stock_metrics)
-                strong_stocks = final_stocks[(final_stocks[f'RS vs {grouping_level}'] == 'Uptrend')].sort_values(by=f'Daily Vol vs {vol_window}D Avg', ascending=False)
+                # Filter for strongest candidates only
+                strong_stocks = final_stocks[(final_stocks[f'RS vs {grouping_level}'] == 'Uptrend') & (final_stocks['Volume Breakout (>150%)'] == 'Yes 🔥')].copy()
                 
-                cols = ['Symbol', 'Exchange', 'Latest Close', f'RS vs {grouping_level}', f'Daily Vol vs {vol_window}D Avg', 'Volume Breakout (>150%)']
-                strong_stocks = strong_stocks[[c for c in cols if c in strong_stocks.columns]]
-                
+                # If the filter removes everything, just show all uptrend stocks
+                if strong_stocks.empty:
+                    strong_stocks = final_stocks[(final_stocks[f'RS vs {grouping_level}'] == 'Uptrend')].copy()
+                    st.write(f"No volume breakouts today. Showing all outperforming stocks in **{selected_group}**:")
+                else:
+                    st.write(f"🔥 Showing outperforming stocks in **{selected_group}** with Active Volume Breakouts:")
+                    
                 st.dataframe(strong_stocks, use_container_width=True)
             else:
                 st.warning(f"No stocks in {selected_group} have enough historical data.")
@@ -172,19 +187,17 @@ if page == "Scanner Dashboard":
 # ==========================================
 elif page == "Market Heatmap 📊":
     st.title("📊 Market Heatmap")
-    st.markdown("Visualize capital flow and performance across the market simultaneously. Block size represents **Volume**, while color represents **Percentage Return**.")
+    st.markdown("Visualize capital flow and performance across the market simultaneously.")
 
     st.sidebar.header("1. Data Feed")
     st.sidebar.success("🟢 Connected to Live Google Sheet")
 
-    # --- HEATMAP SCAN LEVEL TOGGLE ---
     st.sidebar.header("2. Map Level")
     grouping_level = st.sidebar.radio("Group heatmap by:", ["Sector", "Industry"])
 
     with st.spinner("Generating heatmap..."):
         try:
             df = load_google_sheet()
-            
             df.columns = df.columns.str.strip()
             df['Close'] = pd.to_numeric(df['Close'].astype(str).str.replace(r'[\$,]', '', regex=True), errors='coerce')
             df['Volume'] = pd.to_numeric(df['Volume'].astype(str).str.replace(r'[\$,]', '', regex=True), errors='coerce')
@@ -198,18 +211,15 @@ elif page == "Market Heatmap 📊":
                 df['Exchange'] = df['Exchange'].astype(str).str.strip()
                 available_exchanges = sorted(df[df['Exchange'] != 'nan']['Exchange'].unique().tolist())
                 selected_exchanges = st.sidebar.multiselect("Select Exchange(s):", options=available_exchanges, default=available_exchanges)
-                
                 if not selected_exchanges:
                     st.warning("⚠️ Please select at least one exchange in the sidebar to generate the heatmap.")
                     st.stop()
-                    
                 df = df[df['Exchange'].isin(selected_exchanges)]
             
             df = df.sort_values(by=['Symbol', 'Date'])
-            
             trading_days = len(df['Date'].unique())
             if trading_days < 2:
-                st.error("⚠️ Not enough data for the selected exchanges. You need at least 2 days to calculate percentage returns.")
+                st.error("⚠️ Not enough data for the selected exchanges.")
                 st.stop()
                 
         except Exception as e:
@@ -219,43 +229,31 @@ elif page == "Market Heatmap 📊":
     st.sidebar.header("3. Heatmap Settings")
     max_map_periods = trading_days - 1
     map_window = st.sidebar.slider("Heatmap Timeframe (Days to measure Return)", min_value=1, max_value=max_map_periods, value=1)
-    
     color_sensitivity = st.sidebar.slider("Color Sensitivity (Max Return %)", min_value=1.0, max_value=30.0, value=5.0, step=0.5)
 
-    # 1. Calculate Returns
     df['Return (%)'] = df.groupby('Symbol')['Close'].pct_change(periods=map_window) * 100
     latest_date = df['Date'].max()
     latest_df = df[df['Date'] == latest_date].copy()
     
-    # 2. Clean numeric anomalies (Drops rows with NaN/Inf returns or 0 volume)
     latest_df = latest_df.replace([np.inf, -np.inf], np.nan)
     latest_df = latest_df.dropna(subset=['Return (%)', 'Volume', 'Symbol', grouping_level])
     latest_df = latest_df[latest_df['Volume'] > 0] 
-    
-    # 3. Reset index (Crucial for Plotly Express alignment after slicing data)
     latest_df = latest_df.reset_index(drop=True)
     
-    # 4. Clean Text to Prevent "Leaf/Branch" Collisions
-    # Strip whitespace and drop any completely blank symbols so Plotly doesn't build a broken path
     latest_df['Symbol'] = latest_df['Symbol'].astype(str).str.strip()
     latest_df = latest_df[latest_df['Symbol'] != '']
     latest_df = latest_df[latest_df['Symbol'].str.lower() != 'nan']
     
-    # Clean the grouping column
     latest_df[grouping_level] = latest_df[grouping_level].astype(str).str.strip()
     latest_df.loc[latest_df[grouping_level] == '', grouping_level] = 'Unclassified'
     latest_df.loc[latest_df[grouping_level].str.lower() == 'nan', grouping_level] = 'Unclassified'
 
-    # 5. Guarantee Unique Level Names
-    # We add distinct space padding to ensure a Symbol name can never exactly match an Industry name
     latest_df['Root'] = 'Overall Market'
     latest_df[grouping_level] = latest_df[grouping_level] + " "
     latest_df['Symbol'] = latest_df['Symbol'] + "  "
-    
     latest_df = latest_df.drop_duplicates(subset=['Symbol'], keep='last')
 
     if not latest_df.empty:
-        # Notice we use 'Root' now instead of px.Constant
         fig = px.treemap(
             latest_df,
             path=['Root', grouping_level, 'Symbol'],
@@ -266,62 +264,35 @@ elif page == "Market Heatmap 📊":
             range_color=[-color_sensitivity, color_sensitivity], 
             hover_data={'Close': ':.2f', 'Volume': ':.0f', 'Return (%)': ':.2f'}
         )
-
-        fig.update_layout(
-            margin=dict(t=30, l=10, r=10, b=10),
-            height=700,
-            coloraxis_colorbar=dict(title=f"{map_window}-Day Return (%)")
-        )
-        
-        fig.update_traces(
-            textposition='middle center',
-            textinfo="label+text+value",
-            hovertemplate="<b>%{label}</b><br>Return: %{color:.2f}%<br>Volume: %{value:,.0f}<extra></extra>"
-        )
-
+        fig.update_layout(margin=dict(t=30, l=10, r=10, b=10), height=700, coloraxis_colorbar=dict(title=f"{map_window}-Day Return (%)"))
+        fig.update_traces(textposition='middle center', textinfo="label+text+value", hovertemplate="<b>%{label}</b><br>Return: %{color:.2f}%<br>Volume: %{value:,.0f}<extra></extra>")
         st.plotly_chart(fig, use_container_width=True)
-        st.info(f"**Viewing Date:** {latest_date.strftime('%Y-%m-%d')} | **Comparing against:** {map_window} trading day(s) prior.")
+        st.info(f"**Viewing Date:** {latest_date.strftime('%Y-%m-%d')}")
     else:
-        st.warning("No data available to plot for the selected timeframe and exchanges.")
+        st.warning("No data available to plot.")
 
 # ==========================================
 # PAGE 3: HOW IT WORKS (METRICS GUIDE)
 # ==========================================
 elif page == "How It Works (Metrics)":
     st.title("📚 How It Works: A Trader's Guide to the Data")
-    st.markdown("Trading isn't about predicting the future; it's about following the footprints of big money. This guide breaks down the core calculations powering the scanner so you can read the market's story with confidence.")
     st.divider()
 
     st.header("1. Momentum Acceleration")
-    st.markdown("**The Concept:** This measures whether a sector/industry's trend is speeding up or running out of gas. A group might be up overall, but if its recent gains are shrinking, the trend is dying.")
-    st.markdown("**🚗 The Novice Analogy:** Imagine you are driving a car. Your *Long-Term Return* is your average speed on the highway (60 mph). Your *Short-Term Return* is pressing the gas pedal to pass someone (80 mph). This metric measures how hard you are pressing the gas right now.")
+    st.markdown("**The Concept:** Measures whether a trend is speeding up or running out of gas.")
     st.latex(r"Acceleration = R_{short} - R_{long}")
-    st.success("**💡 Real-World Insight:** If a group is up 5% over the long-term, but up 8% in the short-term, its acceleration is **+3.00**. This tells you new buyers are aggressively stepping in *right now*. You want to look for positive numbers at the top of the Phase 1 chart.")
     st.write("---")
 
-    st.header("2. Volume Surge (Macro Level)")
-    st.markdown("**The Concept:** Price moves can be faked by a lack of liquidity, but massive trading volume cannot be faked. This metric measures the influx of broad capital into an entire sector or industry relative to its normal baseline.")
-    st.markdown("**👣 The Novice Analogy:** Think of volume like footprints in the snow. A few retail traders leave a light trail. But when hedge funds and mutual funds buy into a sector, they march an entire army through the snow. This metric looks for the army.")
+    st.header("2. Macro Volume Surge")
+    st.markdown("**The Concept:** Measures the influx of broad capital into an entire group relative to its normal baseline.")
     st.latex(r"\text{Macro Surge} = \frac{V_{current}}{\overline{V}_{baseline}}")
-    st.success("**💡 Real-World Insight:** A ratio of **1.50** means today's macro volume is 50% higher than its recent average. If a group is accelerating in price *and* has a volume ratio above 1.0, the move is legitimate. Institutions are actively buying.")
     st.write("---")
 
     st.header("3. RS vs Group (Relative Strength)")
-    st.markdown("**The Concept:** This evaluates a stock's performance directly against its own peers rather than the broad market.")
-    st.markdown("**🏃‍♂️ The Novice Analogy:** Imagine a track team running a race with a heavy tailwind. The whole team will run faster times (the sector is going up). But Relative Strength asks: *Who is the fastest runner on the team?* You don't just want a stock that is being dragged up by the wind; you want the strongest athlete.")
+    st.markdown("**The Concept:** Evaluates a stock's performance directly against its peers.")
     st.latex(r"RS = \frac{P_{stock}}{P_{group}}")
-    st.success("**💡 Real-World Insight:** If the scanner shows **'Uptrend'**, it means this specific stock is gaining more on green days and losing less on red days compared to its peers. This is your prime target.")
     st.write("---")
-
-    st.header("4. Daily Vol vs Baseline Avg (Stock Level)")
-    st.markdown("**The Concept:** This looks at an individual stock's trading activity against its own normal behavior, isolating it from the broader market.")
-    st.markdown("**🗣️ The Novice Analogy:** Imagine a normally quiet library where suddenly 50 people start having a loud conversation. You instantly know something specific is happening at that exact table.")
-    st.latex(r"\text{Stock Volume Ratio} = \frac{V_{daily}}{\overline{V}_{average}}")
-    st.success("**💡 Real-World Insight:** If a stock normally trades 1 million shares but today traded 3 million, something fundamental (news, earnings, a big fund buying) just attracted eyeballs. It confirms the stock has its own catalyst.")
-    st.write("---")
-
-    st.header("5. Volume Breakout (>150%)")
-    st.markdown("**The Concept:** This is a strict, binary filter that flags stocks experiencing extreme, undeniable buying pressure.")
-    st.markdown("**🚨 The Novice Analogy:** This is your smoke alarm. It only rings when the volume exceeds 1.5 times the normal limits.")
-    st.latex(r"\text{Breakout Trigger} = V_{daily} > (1.5 \times \overline{V}_{average})")
-    st.success("**💡 Real-World Insight:** If the tool flags **'Yes 🔥'**, it is highly probable that 'smart money' (institutional algorithms) is accumulating shares. These stocks are often the safest entries for swing trades because big money is actively supporting the price.")
+    
+    st.header("4. Volume-Weighted Trend (10-Day Volume Flow)")
+    st.markdown("**The Concept:** Directly pulled from your **Technical Analysis** file concepts, this metric compares total trading volume on up-days versus down-days to expose hidden institutional accumulation or distribution over the last 10 days.")
+    st.latex(r"\text{Flow} = \frac{\sum V_{green\_days}}{\sum V_{red\_days}}")
