@@ -36,7 +36,7 @@ if page == "Scanner Dashboard":
             df = load_google_sheet()
             df.columns = df.columns.str.strip()
             
-            # --- DATA CLEANING (Added Open for Volume Flow calculation) ---
+            # --- DATA CLEANING ---
             cols_to_clean = ['Open', 'Close', 'Volume']
             for col in cols_to_clean:
                 if col in df.columns:
@@ -68,17 +68,26 @@ if page == "Scanner Dashboard":
             trading_days = len(df['Date'].unique())
             latest_date = df['Date'].max()
             
-            if trading_days < 3:
-                st.error(f"⚠️ **Error:** Your dataset only has {trading_days} day(s) of history. You need at least 3 days.")
-                st.stop()
-                
-            st.sidebar.caption(f"Last updated: {latest_date.strftime('%Y-%m-%d')}")
-            
         except Exception as e:
             st.error(f"Failed to load data. Error: {e}")
             st.stop()
 
+        # --- SIDEBAR: DYNAMIC TIMEFRAMES & PRICE FILTER ---
         st.sidebar.header("3. Analysis Parameters")
+        
+        # NEW PRICE FILTER
+        min_price = st.sidebar.number_input("Minimum Stock Price ($)", min_value=0.0, value=10.0, step=1.0)
+        st.sidebar.caption("Filters out low-priced stocks to focus on institutional liquidity.")
+        
+        # Apply Price Filter (Drops any stock where the latest close is below the minimum)
+        latest_closes = df.groupby('Symbol')['Close'].last()
+        valid_symbols = latest_closes[latest_closes >= min_price].index
+        df = df[df['Symbol'].isin(valid_symbols)]
+        
+        if df.empty:
+            st.error(f"⚠️ No stocks found closing above ${min_price}. Please lower your minimum price.")
+            st.stop()
+        
         max_periods = trading_days - 1
         
         long_window = st.sidebar.slider("Long-Term Momentum (Days)", min_value=2, max_value=max_periods, value=min(5, max_periods))
@@ -123,7 +132,7 @@ if page == "Scanner Dashboard":
             stock_df = df[df[grouping_level] == selected_group].copy()
             stock_metrics = []
             tickers = stock_df['Symbol'].unique()
-            min_required = max(long_window + 1, vol_window, rs_window, 10) # Added 10 for volume flow
+            min_required = max(long_window + 1, vol_window, rs_window, 10) 
             
             with st.spinner(f"Scanning stocks in {selected_group}..."):
                 for ticker in tickers:
@@ -135,7 +144,6 @@ if page == "Scanner Dashboard":
                     t_data['RS_MA'] = t_data['RS'].rolling(window=rs_window).mean()
                     t_data['Vol_Baseline'] = t_data['Volume'].rolling(window=vol_window).mean()
                     
-                    # --- PHASE 3: VOLUME-WEIGHTED TREND ---
                     if has_open:
                         t_data['Green_Vol'] = np.where(t_data['Close'] > t_data['Open'], t_data['Volume'], 0)
                         t_data['Red_Vol'] = np.where(t_data['Close'] < t_data['Open'], t_data['Volume'], 0)
@@ -167,10 +175,8 @@ if page == "Scanner Dashboard":
             
             if stock_metrics:
                 final_stocks = pd.DataFrame(stock_metrics)
-                # Filter for strongest candidates only
                 strong_stocks = final_stocks[(final_stocks[f'RS vs {grouping_level}'] == 'Uptrend') & (final_stocks['Volume Breakout (>150%)'] == 'Yes 🔥')].copy()
                 
-                # If the filter removes everything, just show all uptrend stocks
                 if strong_stocks.empty:
                     strong_stocks = final_stocks[(final_stocks[f'RS vs {grouping_level}'] == 'Uptrend')].copy()
                     st.write(f"No volume breakouts today. Showing all outperforming stocks in **{selected_group}**:")
@@ -218,21 +224,31 @@ elif page == "Market Heatmap 📊":
             
             df = df.sort_values(by=['Symbol', 'Date'])
             trading_days = len(df['Date'].unique())
-            if trading_days < 2:
-                st.error("⚠️ Not enough data for the selected exchanges.")
-                st.stop()
+            latest_date = df['Date'].max()
                 
         except Exception as e:
             st.error(f"Failed to load data. Error: {e}")
             st.stop()
 
     st.sidebar.header("3. Heatmap Settings")
+    
+    # NEW PRICE FILTER FOR HEATMAP
+    min_price = st.sidebar.number_input("Minimum Stock Price ($)", min_value=0.0, value=10.0, step=1.0)
+    
+    # Apply Price Filter 
+    latest_closes = df.groupby('Symbol')['Close'].last()
+    valid_symbols = latest_closes[latest_closes >= min_price].index
+    df = df[df['Symbol'].isin(valid_symbols)]
+    
+    if df.empty:
+        st.error(f"⚠️ No stocks found closing above ${min_price}. Please lower your minimum price.")
+        st.stop()
+
     max_map_periods = trading_days - 1
     map_window = st.sidebar.slider("Heatmap Timeframe (Days to measure Return)", min_value=1, max_value=max_map_periods, value=1)
     color_sensitivity = st.sidebar.slider("Color Sensitivity (Max Return %)", min_value=1.0, max_value=30.0, value=5.0, step=0.5)
 
     df['Return (%)'] = df.groupby('Symbol')['Close'].pct_change(periods=map_window) * 100
-    latest_date = df['Date'].max()
     latest_df = df[df['Date'] == latest_date].copy()
     
     latest_df = latest_df.replace([np.inf, -np.inf], np.nan)
@@ -294,5 +310,5 @@ elif page == "How It Works (Metrics)":
     st.write("---")
     
     st.header("4. Volume-Weighted Trend (10-Day Volume Flow)")
-    st.markdown("**The Concept:** Directly pulled from your **Technical Analysis** file concepts, this metric compares total trading volume on up-days versus down-days to expose hidden institutional accumulation or distribution over the last 10 days.")
+    st.markdown("**The Concept:** Compares total trading volume on up-days versus down-days to expose hidden institutional accumulation or distribution over the last 10 days.")
     st.latex(r"\text{Flow} = \frac{\sum V_{green\_days}}{\sum V_{red\_days}}")
