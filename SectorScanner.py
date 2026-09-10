@@ -36,14 +36,14 @@ if page == "Scanner Dashboard":
             df = load_google_sheet()
             df.columns = df.columns.str.strip()
             
-            # --- DATA CLEANING ---
-            cols_to_clean = ['Open', 'Close', 'Volume']
+            # --- DATA CLEANING (Added High and Low for CLV) ---
+            cols_to_clean = ['Open', 'High', 'Low', 'Close', 'Volume']
             for col in cols_to_clean:
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col].astype(str).str.replace(r'[\$,]', '', regex=True), errors='coerce')
             
             df['Date'] = pd.to_datetime(df['Date'])
-            has_open = 'Open' in df.columns
+            has_ohlc = all(c in df.columns for c in ['Open', 'High', 'Low'])
             
             if 'Exchange' in df.columns:
                 df['Exchange'] = df['Exchange'].astype(str).str.strip()
@@ -75,11 +75,10 @@ if page == "Scanner Dashboard":
         # --- SIDEBAR: DYNAMIC TIMEFRAMES & PRICE FILTER ---
         st.sidebar.header("3. Analysis Parameters")
         
-        # NEW PRICE FILTER
         min_price = st.sidebar.number_input("Minimum Stock Price ($)", min_value=0.0, value=10.0, step=1.0)
         st.sidebar.caption("Filters out low-priced stocks to focus on institutional liquidity.")
         
-        # Apply Price Filter (Drops any stock where the latest close is below the minimum)
+        # Apply Price Filter
         latest_closes = df.groupby('Symbol')['Close'].last()
         valid_symbols = latest_closes[latest_closes >= min_price].index
         df = df[df['Symbol'].isin(valid_symbols)]
@@ -90,10 +89,10 @@ if page == "Scanner Dashboard":
         
         max_periods = trading_days - 1
         
-        long_window = st.sidebar.slider("Long-Term Momentum (Days)", min_value=2, max_value=max_periods, value=min(5, max_periods))
-        short_window = st.sidebar.slider("Short-Term Momentum (Days)", min_value=1, max_value=long_window-1, value=min(1, long_window-1))
-        vol_window = st.sidebar.slider("Baseline Volume Avg (Days)", min_value=2, max_value=trading_days, value=min(5, trading_days))
-        rs_window = st.sidebar.slider("Relative Strength Trend (Days)", min_value=2, max_value=trading_days, value=min(3, trading_days))
+        long_window = st.sidebar.slider("Long-Term Momentum (Days)", min_value=2, max_value=max_periods, value=min(21, max_periods))
+        short_window = st.sidebar.slider("Short-Term Momentum (Days)", min_value=1, max_value=long_window-1, value=min(5, long_window-1))
+        vol_window = st.sidebar.slider("Baseline Volume Avg (Days)", min_value=2, max_value=trading_days, value=min(50, trading_days))
+        rs_window = st.sidebar.slider("Relative Strength Trend (Days)", min_value=2, max_value=trading_days, value=min(10, trading_days))
 
         # --- PHASE 1: MACRO ROLL-UP ---
         st.header(f"Phase 1: {grouping_level} Rotation (Capital Flows)")
@@ -124,7 +123,7 @@ if page == "Scanner Dashboard":
         st.dataframe(group_results, use_container_width=True)
         st.divider()
 
-        # --- PHASE 2 & 3: STOCK SCREENER WITH VOLUME FLOW ---
+        # --- PHASE 2 & 3: STOCK SCREENER WITH CLV & VOLUME FLOW ---
         st.header(f"Phase 2: Stock Screener (Relative Strength, Breakouts, & Accumulation)")
         selected_group = st.selectbox(f"Select a Leading {grouping_level} to Scan:", options=group_results[grouping_level].tolist())
         
@@ -144,7 +143,12 @@ if page == "Scanner Dashboard":
                     t_data['RS_MA'] = t_data['RS'].rolling(window=rs_window).mean()
                     t_data['Vol_Baseline'] = t_data['Volume'].rolling(window=vol_window).mean()
                     
-                    if has_open:
+                    if has_ohlc:
+                        # 1. Close Location Value (CLV)
+                        t_data['Range'] = t_data['High'] - t_data['Low']
+                        t_data['CLV'] = np.where(t_data['Range'] > 0, ((t_data['Close'] - t_data['Low']) - (t_data['High'] - t_data['Close'])) / t_data['Range'], 0)
+                        
+                        # 2. Volume-Weighted Trend
                         t_data['Green_Vol'] = np.where(t_data['Close'] > t_data['Open'], t_data['Volume'], 0)
                         t_data['Red_Vol'] = np.where(t_data['Close'] < t_data['Open'], t_data['Volume'], 0)
                         t_data['Green_Vol_10D'] = t_data['Green_Vol'].rolling(window=10).sum()
@@ -155,14 +159,24 @@ if page == "Scanner Dashboard":
                     rs_trend = "Uptrend" if latest_t['RS'] > latest_t['RS_MA'] else "Downtrend"
                     vol_breakout = "Yes 🔥" if latest_t['Volume'] > (1.5 * latest_t['Vol_Baseline']) else "No"
                     
-                    if has_open:
+                    if has_ohlc:
+                        # CLV Status
+                        if latest_t['CLV'] > 0.5:
+                            clv_status = "Bullish Accumulation 🟢"
+                        elif latest_t['CLV'] < -0.5:
+                            clv_status = "Bearish Distribution 🔴"
+                        else:
+                            clv_status = "Neutral ⚪"
+
+                        # Volume Flow Status
                         flow_ratio = latest_t['Vol_Flow_Ratio']
                         if pd.isna(flow_ratio):
                             flow_status = "N/A"
                         else:
                             flow_status = f"{round(flow_ratio, 2)}x (Buy > Sell)" if flow_ratio > 1.0 else f"{round(flow_ratio, 2)}x (Sell > Buy)"
                     else:
-                        flow_status = "N/A (Missing Open data)"
+                        clv_status = "N/A (Missing High/Low)"
+                        flow_status = "N/A (Missing Open)"
                     
                     stock_metrics.append({
                         'Symbol': ticker,
@@ -170,6 +184,7 @@ if page == "Scanner Dashboard":
                         'Latest Close': latest_t['Close'],
                         f'RS vs {grouping_level}': rs_trend,
                         'Volume Breakout (>150%)': vol_breakout,
+                        'Daily Control (CLV)': clv_status,
                         '10-Day Vol Flow': flow_status
                     })
             
@@ -309,6 +324,11 @@ elif page == "How It Works (Metrics)":
     st.latex(r"RS = \frac{P_{stock}}{P_{group}}")
     st.write("---")
     
-    st.header("4. Volume-Weighted Trend (10-Day Volume Flow)")
+    st.header("4. Daily Control (Close Location Value)")
+    st.markdown("**The Concept:** Derived from your **Technical Analysis** file, this identifies whether institutions bought heavily into the closing bell, even on volatile days.")
+    st.latex(r"CLV = \frac{(Close - Low) - (High - Close)}{High - Low}")
+    st.write("---")
+    
+    st.header("5. Volume-Weighted Trend (10-Day Volume Flow)")
     st.markdown("**The Concept:** Compares total trading volume on up-days versus down-days to expose hidden institutional accumulation or distribution over the last 10 days.")
     st.latex(r"\text{Flow} = \frac{\sum V_{green\_days}}{\sum V_{red\_days}}")
